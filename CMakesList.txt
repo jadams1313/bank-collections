@@ -1,68 +1,23 @@
-# CMakeLists.txt
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.16)
 project(FinanceTracker VERSION 1.0.0 LANGUAGES CXX)
 
-# Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
 
-# Compiler-specific options
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic -O2)
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        add_compile_options(-g -fsanitize=address -fsanitize=undefined)
-        add_link_options(-fsanitize=address -fsanitize=undefined)
-    endif()
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-    add_compile_options(/W4 /O2)
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        add_compile_options(/Zi)
-    endif()
-endif()
+# Find Qt6
+find_package(Qt6 COMPONENTS Core Widgets REQUIRED)
 
-# Find required packages
-find_package(SQLite3 REQUIRED)
-find_package(Threads REQUIRED)
+# Source files
+add_executable(${PROJECT_NAME} WIN32 main.cpp)
 
-# Optional: Find SQLCipher for encryption (falls back to SQLite3 if not found)
-find_library(SQLCIPHER_LIBRARY NAMES sqlcipher)
-find_path(SQLCIPHER_INCLUDE_DIR NAMES sqlcipher/sqlite3.h)
-
-if(SQLCIPHER_LIBRARY AND SQLCIPHER_INCLUDE_DIR)
-    message(STATUS "Using SQLCipher for encryption support")
-    set(DATABASE_LIBRARY ${SQLCIPHER_LIBRARY})
-    set(DATABASE_INCLUDE_DIR ${SQLCIPHER_INCLUDE_DIR})
-    add_definitions(-DUSE_SQLCIPHER=1)
-else()
-    message(STATUS "Using SQLite3 (no encryption support)")
-    set(DATABASE_LIBRARY SQLite::SQLite3)
-    set(DATABASE_INCLUDE_DIR "")
-endif()
-
-# Create executable
-add_executable(finance_tracker finance_app.cpp)
-
-# Link libraries
-target_link_libraries(finance_tracker 
-    PRIVATE 
-    ${DATABASE_LIBRARY}
-    Threads::Threads
+# Link Qt libraries
+target_link_libraries(${PROJECT_NAME}
+    Qt6::Core
+    Qt6::Widgets
 )
 
-# Include directories
-if(DATABASE_INCLUDE_DIR)
-    target_include_directories(finance_tracker PRIVATE ${DATABASE_INCLUDE_DIR})
-endif()
-
-# Installation
-install(TARGETS finance_tracker
-    RUNTIME DESTINATION bin
-)
-
-# Create package
-set(CPACK_PACKAGE_NAME "FinanceTracker")
-set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Personal Finance Tracking Application")
-set(CPACK_PACKAGE_VENDOR "Your Company")
-set(CPACK_PACKAGE_CONTACT "your.email@example.com")
+# Link SQLite (using Qt's bundled version or system)
+target_link_libraries(${PROJECT_NAME} sqlite3)
