@@ -42,7 +42,11 @@
 #include <algorithm>
 #include <functional>
 #include <random>
-#include <sqlite3.h>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlError>
+#include <QVariant>
+#include <QDebug>
 
 
 using PersonId = std::uint64_t;
@@ -206,76 +210,40 @@ public:
     }
 };
 
-class SQLiteDatabase {
-private:
-    sqlite3* db_;
-    std::mutex db_mutex_;
-
-public:
-    SQLiteDatabase() : db_(nullptr) {}
-
-    ~SQLiteDatabase() {
-        if (db_) {
-            sqlite3_close(db_);
-        }
-    }
-
-    bool open(const QString& filename) {
-        std::lock_guard<std::mutex> lock(db_mutex_);
-        
-        int rc = sqlite3_open(filename.toStdString().c_str(), &db_);
-        if (rc != SQLITE_OK) {
-            return false;
-        }
-
-        execute("PRAGMA journal_mode=WAL;");
-        execute("PRAGMA foreign_keys=ON;");
-        execute("PRAGMA cache_size=10000;");
-        execute("PRAGMA synchronous=NORMAL;");
-
-        return true;
-    }
-
-    bool execute(const QString& sql) {
-        std::lock_guard<std::mutex> lock(db_mutex_);
-        char* error_msg = nullptr;
-        int rc = sqlite3_exec(db_, sql.toStdString().c_str(), nullptr, nullptr, &error_msg);
-        
-        if (error_msg) {
-            sqlite3_free(error_msg);
-        }
-        
-        return rc == SQLITE_OK;
-    }
-
-    sqlite3* get() { return db_; }
-    std::mutex& getMutex() { return db_mutex_; }
-};
-
 class FinanceDatabaseManager {
 private:
-    SQLiteDatabase db_;
+    QSqlDatabase db_;
 
 public:
     bool initialize(const QString& db_path) {
-        if (!db_.open(db_path)) {
+        db_ = QSqlDatabase::addDatabase("QSQLITE");
+        db_.setDatabaseName(db_path);
+        if (!db_.open()) {
+            qWarning() << "Failed to open database:" << db_.lastError().text();
             return false;
         }
         return createTables();
     }
 
+    bool isOpen() const {
+        return db_.isOpen();
+    }
+
 private:
     bool createTables() {
-        const QString create_people = R"(
+        QSqlQuery query;
+        bool success = true;
+
+        success &= query.exec(R"(
             CREATE TABLE IF NOT EXISTS people (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 email TEXT,
                 created_at INTEGER NOT NULL
             );
-        )";
+        )");
 
-        const QString create_accounts = R"(
+        success &= query.exec(R"(
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -286,9 +254,9 @@ private:
                 last_updated INTEGER NOT NULL,
                 FOREIGN KEY (owner_id) REFERENCES people(id)
             );
-        )";
+        )");
 
-        const QString create_transactions = R"(
+        success &= query.exec(R"(
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY,
                 from_account_id INTEGER NOT NULL,
@@ -303,148 +271,119 @@ private:
                 FOREIGN KEY (from_account_id) REFERENCES accounts(id),
                 FOREIGN KEY (to_account_id) REFERENCES accounts(id)
             );
-        )";
+        )");
 
-        const QString create_indexes = R"(
-            CREATE INDEX IF NOT EXISTS idx_accounts_owner ON accounts(owner_id);
-            CREATE INDEX IF NOT EXISTS idx_transactions_from_account ON transactions(from_account_id);
-            CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
-        )";
-
-        return db_.execute(create_people) && 
-               db_.execute(create_accounts) && 
-               db_.execute(create_transactions) &&
-               db_.execute(create_indexes);
+        if (!success) {
+            qWarning() << "Error creating tables:" << query.lastError().text();
+        }
+        return success;
     }
 
 public:
     bool savePerson(const Person& person) {
-        std::lock_guard<std::mutex> lock(db_.getMutex());
-        
-        const char* sql = "INSERT OR REPLACE INTO people (id, name, email, created_at) VALUES (?, ?, ?, ?)";
-        sqlite3_stmt* stmt;
-        
-        if (sqlite3_prepare_v2(db_.get(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            return false;
-        }
-        
-        sqlite3_bind_int64(stmt, 1, person.getId());
-        sqlite3_bind_text(stmt, 2, person.getName().c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 3, person.getEmail().c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 4, std::chrono::duration_cast<std::chrono::seconds>(
-            person.getCreatedAt().time_since_epoch()).count());
-        
-        bool success = sqlite3_step(stmt) == SQLITE_DONE;
-        sqlite3_finalize(stmt);
-        return success;
+        QSqlQuery query;
+        query.prepare("INSERT OR REPLACE INTO people (id, name, email, created_at) VALUES (?, ?, ?, ?)");
+        query.addBindValue(static_cast<qint64>(person.getId()));
+        query.addBindValue(QString::fromStdString(person.getName()));
+        query.addBindValue(QString::fromStdString(person.getEmail()));
+        query.addBindValue(static_cast<qint64>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                person.getCreatedAt().time_since_epoch()).count()));
+        return query.exec();
     }
 
     bool saveAccount(const Account& account) {
-        std::lock_guard<std::mutex> lock(db_.getMutex());
-        
-        const char* sql = "INSERT OR REPLACE INTO accounts (id, name, type, balance, owner_id, created_at, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?)";
-        sqlite3_stmt* stmt;
-        
-        if (sqlite3_prepare_v2(db_.get(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        QSqlQuery query;
+        query.prepare(R"(
+            INSERT OR REPLACE INTO accounts
+            (id, name, type, balance, owner_id, created_at, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        )");
+
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        query.addBindValue(static_cast<qint64>(account.getId()));
+        query.addBindValue(QString::fromStdString(account.getName()));
+        query.addBindValue(static_cast<int>(account.getType()));
+        query.addBindValue(static_cast<qint64>(account.getBalance()));
+        query.addBindValue(static_cast<qint64>(account.getOwnerId()));
+        query.addBindValue(static_cast<qint64>(now));
+        query.addBindValue(static_cast<qint64>(now));
+
+        if (!query.exec()) {
+            qWarning() << "Error saving account:" << query.lastError().text();
             return false;
         }
-        
-        sqlite3_bind_int64(stmt, 1, account.getId());
-        sqlite3_bind_text(stmt, 2, account.getName().c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 3, static_cast<int>(account.getType()));
-        sqlite3_bind_int64(stmt, 4, account.getBalance());
-        sqlite3_bind_int64(stmt, 5, account.getOwnerId());
-        auto now = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        sqlite3_bind_int64(stmt, 6, now);
-        sqlite3_bind_int64(stmt, 7, now);
-        
-        bool success = sqlite3_step(stmt) == SQLITE_DONE;
-        sqlite3_finalize(stmt);
-        return success;
+        return true;
     }
 
     bool saveTransaction(const Transaction& transaction) {
-        std::lock_guard<std::mutex> lock(db_.getMutex());
-        
-        const char* sql = "INSERT OR REPLACE INTO transactions (id, from_account_id, to_account_id, amount, type, status, description, category, reference, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        sqlite3_stmt* stmt;
-        
-        if (sqlite3_prepare_v2(db_.get(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        QSqlQuery query;
+        query.prepare(R"(
+            INSERT OR REPLACE INTO transactions
+            (id, from_account_id, to_account_id, amount, type, status, description, category, reference, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        )");
+
+        query.addBindValue(static_cast<qint64>(transaction.getId()));
+        query.addBindValue(static_cast<qint64>(transaction.getFromAccountId()));
+
+        if (transaction.getToAccountId().has_value())
+            query.addBindValue(static_cast<qint64>(transaction.getToAccountId().value()));
+        else
+            query.addBindValue(QVariant(QVariant::Int)); // NULL
+
+        query.addBindValue(static_cast<qint64>(transaction.getAmount()));
+        query.addBindValue(static_cast<int>(transaction.getType()));
+        query.addBindValue(static_cast<int>(transaction.getStatus()));
+        query.addBindValue(QString::fromStdString(transaction.getDescription()));
+        query.addBindValue(QString::fromStdString(transaction.getCategory()));
+        query.addBindValue(QVariant(QVariant::String)); // reference = NULL for now
+        query.addBindValue(static_cast<qint64>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                transaction.getTimestamp().time_since_epoch()).count()));
+
+        if (!query.exec()) {
+            qWarning() << "Error saving transaction:" << query.lastError().text();
             return false;
         }
-        
-        sqlite3_bind_int64(stmt, 1, transaction.getId());
-        sqlite3_bind_int64(stmt, 2, transaction.getFromAccountId());
-        
-        if (transaction.getToAccountId().has_value()) {
-            sqlite3_bind_int64(stmt, 3, transaction.getToAccountId().value());
-        } else {
-            sqlite3_bind_null(stmt, 3);
-        }
-        
-        sqlite3_bind_int64(stmt, 4, transaction.getAmount());
-        sqlite3_bind_int(stmt, 5, static_cast<int>(transaction.getType()));
-        sqlite3_bind_int(stmt, 6, static_cast<int>(transaction.getStatus()));
-        sqlite3_bind_text(stmt, 7, transaction.getDescription().c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 8, transaction.getCategory().c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_null(stmt, 9);
-        sqlite3_bind_int64(stmt, 10, std::chrono::duration_cast<std::chrono::seconds>(
-            transaction.getTimestamp().time_since_epoch()).count());
-        
-        bool success = sqlite3_step(stmt) == SQLITE_DONE;
-        sqlite3_finalize(stmt);
-        return success;
+        return true;
     }
 
     std::vector<std::unique_ptr<Person>> loadAllPeople() {
         std::vector<std::unique_ptr<Person>> people;
-        std::lock_guard<std::mutex> lock(db_.getMutex());
-        
-        const char* sql = "SELECT id, name, email FROM people";
-        sqlite3_stmt* stmt;
-        
-        if (sqlite3_prepare_v2(db_.get(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            return people;
-        }
-        
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            PersonId id = sqlite3_column_int64(stmt, 0);
-            std::string name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-            std::string email = sqlite3_column_text(stmt, 2) ? 
-                               reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)) : "";
-            
+        QSqlQuery query("SELECT id, name, email FROM people");
+
+        while (query.next()) {
+            PersonId id = query.value(0).toULongLong();
+            std::string name = query.value(1).toString().toStdString();
+            std::string email = query.value(2).toString().toStdString();
             people.push_back(std::make_unique<Person>(id, name, email));
         }
-        
-        sqlite3_finalize(stmt);
         return people;
     }
 
     std::vector<std::unique_ptr<Account>> loadAccountsForPerson(PersonId person_id) {
         std::vector<std::unique_ptr<Account>> accounts;
-        std::lock_guard<std::mutex> lock(db_.getMutex());
-        
-        const char* sql = "SELECT id, name, type, balance, owner_id FROM accounts WHERE owner_id = ?";
-        sqlite3_stmt* stmt;
-        
-        if (sqlite3_prepare_v2(db_.get(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        QSqlQuery query;
+        query.prepare("SELECT id, name, type, balance, owner_id FROM accounts WHERE owner_id = ?");
+        query.addBindValue(static_cast<qint64>(person_id));
+
+        if (!query.exec()) {
+            qWarning() << "Error loading accounts:" << query.lastError().text();
             return accounts;
         }
-        
-        sqlite3_bind_int64(stmt, 1, person_id);
-        
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            AccountId id = sqlite3_column_int64(stmt, 0);
-            std::string name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-            AccountType type = static_cast<AccountType>(sqlite3_column_int(stmt, 2));
-            Money balance = sqlite3_column_int64(stmt, 3);
-            PersonId owner_id = sqlite3_column_int64(stmt, 4);
-            
+
+        while (query.next()) {
+            AccountId id = query.value(0).toULongLong();
+            std::string name = query.value(1).toString().toStdString();
+            AccountType type = static_cast<AccountType>(query.value(2).toInt());
+            Money balance = query.value(3).toLongLong();
+            PersonId owner_id = query.value(4).toULongLong();
+
             accounts.push_back(std::make_unique<Account>(id, name, type, owner_id, balance));
         }
-        
-        sqlite3_finalize(stmt);
         return accounts;
     }
 };
@@ -474,9 +413,9 @@ public:
         return std::async(std::launch::async, [credentials]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             return AuthToken{
-                &"${plaid_auth_token}" [ credentials],
-                std::chrono::system_clock::now() + std::chrono::hours(1)
-            };
+    "plaid_access_token_" + credentials,
+    std::chrono::system_clock::now() + std::chrono::hours(1)
+};
         });
     }
     
@@ -928,7 +867,7 @@ public:
 };
 
 class SyncBankDialog : public QDialog {
-    Q_OBJECT q_Obj;
+    Q_OBJECT
 
 private:
     QComboBox* accountCombo;
@@ -979,9 +918,7 @@ public:
     QString getCredentials() const { return credentialsEdit->text(); }
 };
 
-// ===========================================
-// MAIN WINDOW
-// ===========================================
+
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -1194,6 +1131,8 @@ private:
                 }
                 
                 accountItem->setData(0, Qt::UserRole, QVariant::fromValue(account->getId()));
+                Q_DECLARE_METATYPE(AccountId);
+                qRegisterMetaType<AccountId>("AccountId");
             }
             
             personItem->setExpanded(true);
